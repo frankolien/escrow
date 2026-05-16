@@ -9,7 +9,7 @@ import {
   getAccount,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
-import { PublicKey } from "@solana/web3.js";
+import { Keypair, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import { assert } from "chai";
 
 describe("escrow", () => {
@@ -114,5 +114,123 @@ describe("escrow", () => {
     assert.ok(offer.tokenMintA.equals(tokenMintA));
     assert.ok(offer.tokenMintB.equals(tokenMintB));
     assert.strictEqual(offer.tokenBWantedAmount.toString(), wantedAmount.toString());
+  });
+
+  // Helper: create a fresh offer with a unique id and return its derived addresses.
+  const createOffer = async (
+    id: anchor.BN,
+    offered: anchor.BN,
+    wanted: anchor.BN,
+  ) => {
+    const [offerPda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("offer"),
+        maker.publicKey.toBuffer(),
+        id.toArrayLike(Buffer, "le", 8),
+      ],
+      program.programId,
+    );
+    const vault = getAssociatedTokenAddressSync(tokenMintA, offerPda, true);
+    await program.methods
+      .makeOffer(id, offered, wanted)
+      .accounts({
+        maker: maker.publicKey,
+        tokenMintA,
+        tokenMintB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+    return { offerPda, vault };
+  };
+
+  it("takes an offer", async () => {
+    const id = new BN(Date.now() + 1);
+    const offered = new BN(1_000_000);
+    const wanted = new BN(2_000_000);
+    const { offerPda, vault } = await createOffer(id, offered, wanted);
+
+    // Set up the taker: a fresh keypair funded with SOL, holding token B.
+    const taker = Keypair.generate();
+    const airdropSig = await provider.connection.requestAirdrop(
+      taker.publicKey,
+      2 * LAMPORTS_PER_SOL,
+    );
+    await provider.connection.confirmTransaction(airdropSig, "confirmed");
+
+    const takerAtaB = await createAssociatedTokenAccount(
+      provider.connection,
+      taker,
+      tokenMintB,
+      taker.publicKey,
+    );
+    await mintTo(
+      provider.connection,
+      maker,
+      tokenMintB,
+      takerAtaB,
+      maker,
+      wanted.toNumber(),
+    );
+
+    const makerAtaB = getAssociatedTokenAddressSync(tokenMintB, maker.publicKey);
+    const takerAtaA = getAssociatedTokenAddressSync(tokenMintA, taker.publicKey);
+
+    await program.methods
+      .takeOffer()
+      .accountsPartial({
+        taker: taker.publicKey,
+        maker: maker.publicKey,
+        tokenMintA,
+        tokenMintB,
+        offer: offerPda,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([taker])
+      .rpc();
+
+    // Taker received the offered token A.
+    const takerAccountA = await getAccount(provider.connection, takerAtaA);
+    assert.strictEqual(takerAccountA.amount.toString(), offered.toString());
+
+    // Maker received the wanted token B.
+    const makerAccountB = await getAccount(provider.connection, makerAtaB);
+    assert.strictEqual(makerAccountB.amount.toString(), wanted.toString());
+
+    // Vault and offer accounts should be closed.
+    const vaultInfo = await provider.connection.getAccountInfo(vault);
+    assert.isNull(vaultInfo, "vault should be closed");
+    const offerInfo = await provider.connection.getAccountInfo(offerPda);
+    assert.isNull(offerInfo, "offer should be closed");
+  });
+
+  it("refunds an offer", async () => {
+    const id = new BN(Date.now() + 2);
+    const offered = new BN(500_000);
+    const wanted = new BN(1_000_000);
+    const { offerPda, vault } = await createOffer(id, offered, wanted);
+
+    const balanceBefore = (await getAccount(provider.connection, makerAtaA)).amount;
+
+    await program.methods
+      .refundOffer()
+      .accountsPartial({
+        maker: maker.publicKey,
+        tokenMintA,
+        offer: offerPda,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    // Maker's token A balance should be restored by the offered amount.
+    const balanceAfter = (await getAccount(provider.connection, makerAtaA)).amount;
+    assert.strictEqual(
+      (balanceAfter - balanceBefore).toString(),
+      offered.toString(),
+    );
+
+    const vaultInfo = await provider.connection.getAccountInfo(vault);
+    assert.isNull(vaultInfo, "vault should be closed");
+    const offerInfo = await provider.connection.getAccountInfo(offerPda);
+    assert.isNull(offerInfo, "offer should be closed");
   });
 });
